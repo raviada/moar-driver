@@ -1,5 +1,4 @@
 package moar;
-
 import static java.lang.System.currentTimeMillis;
 import static moar.Cost.$;
 import static moar.JsonUtil.info;
@@ -19,7 +18,9 @@ public class ScriptManager {
 
   private final static Logger LOG = LoggerFactory.getLogger(ScriptManager.class);
   private static Class<?> loader = ScriptManager.class;
-  private static final long timeoutMillis = 1000 * 60 * 5;
+  private static final PropertyAccessor props = new PropertyAccessor(ScriptManager.class.getName());
+  private static final long timeoutMillis = props.getLong("timeoutMillis", 1000 * 60 * 5L);
+  private static final Object scriptRoot = props.getString("scriptRoot", "/sql");
 
   public static void setLoader(final Class<?> loader) {
     ScriptManager.loader = loader;
@@ -27,7 +28,6 @@ public class ScriptManager {
 
   private final int tableDoesNotExistErrorCode;
   private final String track;
-  private final String folder;
   private final Connection connection;
   private final long restPeriod = 1000 * 1;
   private final long startMillis;
@@ -47,7 +47,6 @@ public class ScriptManager {
     final String[] param = config.split(";");
     int i = 0;
     track = i < param.length ? param[i++] : "default";
-    folder = (i < param.length ? param[i++] : "/sql") + "/" + track;
   }
 
   private void execute(final PreparedStatement find, final PreparedStatement register, final Statement statement,
@@ -65,6 +64,8 @@ public class ScriptManager {
         }
         return null;
       });
+    } catch (final RuntimeException e) {
+      throw e;
     } catch (final Exception e) {
       throw new RuntimeException(e);
     }
@@ -81,8 +82,8 @@ public class ScriptManager {
       if (tableDoesNotExistErrorCode != ex.getErrorCode()) {
         throw ex;
       }
-      String sql
-          = "CREATE TABLE %s(id BIGINT, instance VARCHAR(255),created DATETIME,completed DATETIME,PRIMARY KEY(id));";
+      String sql = "CREATE TABLE `%s` (`id` BIGINT, `instance` VARCHAR(255),`run_event` VARCHAR(255),";
+      sql += "`created` DATETIME,`completed` DATETIME, PRIMARY KEY(`id`));";
       sql = String.format(sql, "moar_" + track);
       statement.execute(sql);
       id = 1000;
@@ -94,19 +95,19 @@ public class ScriptManager {
   }
 
   private InputStream getResource(final int id) {
-    final String resource = String.format("%s/%d.sql", folder, id);
+    final String resource = String.format("%s/%s/%d.sql", scriptRoot, track, id);
     return loader.getResourceAsStream(resource);
   }
 
   void init() throws SQLException {
     synchronized (Object.class) {
-      String sql = "select id from %s where not isnull(completed) order by id desc";
+      String sql = "select `id` from `%s` where not isnull(`completed`) order by `id` desc";
       sql = String.format(sql, "moar_" + track);
       try (PreparedStatement find = connection.prepareStatement(sql)) {
-        sql = "insert into %s (id, instance, created) values (?, ?, NOW())";
+        sql = "insert into `%s` (`id`, `instance`, `created`, `run_event`) values (?, ?, NOW(), ?)";
         sql = String.format(sql, "moar_" + track);
         try (PreparedStatement register = connection.prepareStatement(sql)) {
-          sql = String.format("update %s set completed=NOW() WHERE id=?", "moar_" + track);
+          sql = String.format("update `%s` set completed=NOW() WHERE id=?", "moar_" + track);
           try (PreparedStatement record = connection.prepareStatement(sql)) {
             try (Statement statement = connection.createStatement()) {
               execute(find, register, statement, record);
@@ -124,10 +125,11 @@ public class ScriptManager {
     record.execute();
   }
 
-  private void register(final PreparedStatement register, final int id) throws SQLException {
+  private void register(final PreparedStatement register, final int id, final String runEvent) throws SQLException {
     int i = 0;
     register.setInt(++i, id);
     register.setString(++i, instance);
+    register.setString(++i, runEvent);
     register.execute();
   }
 
@@ -173,16 +175,24 @@ public class ScriptManager {
    */
   private boolean run(final PreparedStatement register, final Statement statement, final PreparedStatement record,
       final int id) throws Exception {
+    final String runEvent = UUID.randomUUID().toString();
     try {
-      register(register, id);
+      register(register, id, runEvent);
     } catch (final SQLException ex) {
+      warn(LOG, "unable to register script (another instance may be running it)", id);
       return false;
     }
     final StatementReader stream = new StatementReader(getResource(id));
     $("Running " + id, () -> {
       String sql;
+      long statementNumber = 0;
       while (null != (sql = stream.readStatement())) {
-        statement.execute(sql);
+        try {
+          statement.execute(sql);
+          statementNumber++;
+        } catch (final SQLException e) {
+          throw new JsonMessageException("script failed", id, statementNumber, instance, runEvent);
+        }
       }
       return null;
     });

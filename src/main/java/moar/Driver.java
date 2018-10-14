@@ -3,7 +3,6 @@ package moar;
 import static java.lang.System.currentTimeMillis;
 import static java.lang.reflect.Proxy.newProxyInstance;
 import static java.sql.DriverManager.registerDriver;
-import static moar.Cost.$;
 import static moar.JsonUtil.trace;
 import static moar.JsonUtil.warn;
 import static org.slf4j.LoggerFactory.getLogger;
@@ -25,11 +24,8 @@ import java.util.Timer;
 import java.util.TimerTask;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Future;
 import java.util.concurrent.atomic.AtomicReference;
 import org.slf4j.Logger;
-import com.google.common.util.concurrent.MoreExecutors;
 import com.google.common.util.concurrent.RateLimiter;
 
 /**
@@ -42,9 +38,8 @@ public class Driver
   private static final PropertyAccessor props = new PropertyAccessor(Driver.class.getName());
   private static final int CONNECTION_RETRY_LIMIT = props.getInteger("connectionRetryLimit", 100);
   private static final ClassLoader classLoader = Driver.class.getClassLoader();
-  private static Map<String, Future<Callable<Connection>>> connectionSource = new HashMap<>();
+  private static Map<String, Callable<Connection>> connectionSource = new HashMap<>();
   private final static Logger LOG = getLogger(Driver.class);
-  private static final ExecutorService executorService = MoreExecutors.newDirectExecutorService();
   static {
     try {
       registerDriver(new Driver());
@@ -128,14 +123,14 @@ public class Driver
       final ConnectionSpec cs, final String sql) throws SQLException {
     final Connection c = checkConnection(connection, cs);
     final PreparedStatement s = c.prepareStatement(sql);
-    return $("data", PreparedStatement.class, s);
+    return s;
   }
 
   private PreparedStatement createPreparedStatement(final AtomicReference<Connection> connection,
       final ConnectionSpec cs, final String sql, final int i1) throws SQLException {
     final Connection c = checkConnection(connection, cs);
     final PreparedStatement s = c.prepareStatement(sql, i1);
-    return $("data", PreparedStatement.class, s);
+    return s;
   }
 
   private PreparedStatement createPreparedStatement(final AtomicReference<Connection> connection,
@@ -143,7 +138,7 @@ public class Driver
       throws SQLException {
     final Connection c = checkConnection(connection, cs);
     final PreparedStatement s = c.prepareStatement(sql, resultSetType, resultSetConcurrency);
-    return $("data", PreparedStatement.class, s);
+    return s;
   }
 
   private PreparedStatement createPreparedStatement(final AtomicReference<Connection> connection,
@@ -151,46 +146,42 @@ public class Driver
       final int resultSetHoldability) throws SQLException {
     final Connection c = checkConnection(connection, cs);
     final PreparedStatement s = c.prepareStatement(sql, resultSetType, resultSetConcurrency, resultSetHoldability);
-    return $("data", PreparedStatement.class, s);
+    return s;
   }
 
   private PreparedStatement createPreparedStatement(final AtomicReference<Connection> connection,
-      final ConnectionSpec cs, final String sql, final Integer[] i1) throws SQLException {
+      final ConnectionSpec cs, final String sql, final int[] i1) throws SQLException {
     final Connection c = checkConnection(connection, cs);
-    final int[] primitiveArray = new int[i1.length];
-    for (int i = 0; i < i1.length; i++) {
-      primitiveArray[i] = i1[i];
-    }
-    final PreparedStatement s = c.prepareStatement(sql, primitiveArray);
-    return $("data", PreparedStatement.class, s);
+    final PreparedStatement s = c.prepareStatement(sql, i1);
+    return s;
   }
 
   private PreparedStatement createPreparedStatement(final AtomicReference<Connection> connection,
       final ConnectionSpec cs, final String sql, final String[] p1) throws SQLException {
     final Connection c = checkConnection(connection, cs);
     final PreparedStatement s = c.prepareStatement(sql, p1);
-    return $("data", PreparedStatement.class, s);
+    return s;
   }
 
   private Statement createStatement(final AtomicReference<Connection> connection, final ConnectionSpec cs)
       throws SQLException {
     final Connection c = checkConnection(connection, cs);
     final Statement s = c.createStatement();
-    return $("data", Statement.class, s);
+    return s;
   }
 
   private Statement createStatement(final AtomicReference<Connection> connection, final ConnectionSpec cs,
       final int resultSetType, final int resultSetConcurrency) throws SQLException {
     final Connection c = checkConnection(connection, cs);
     final Statement s = c.createStatement(resultSetType, resultSetConcurrency);
-    return $("data", Statement.class, s);
+    return s;
   }
 
   private Statement createStatement(final AtomicReference<Connection> connection, final ConnectionSpec cs,
       final int resultSetType, final int resultSetConcurrency, final int resultSetHoldability) throws SQLException {
     final Connection c = checkConnection(connection, cs);
     final Statement s = c.createStatement(resultSetType, resultSetConcurrency, resultSetHoldability);
-    return $("data", Statement.class, s);
+    return s;
   }
 
   private Connection doConnect(final ConnectionSpec cs) throws SQLException {
@@ -223,7 +214,7 @@ public class Driver
     while (c == null) {
       try {
         synchronized (connectionSource) {
-          c = connectionSource.get(cs.getUrl()).get().call();
+          c = connectionSource.get(cs.getUrl()).call();
         }
       } catch (final InterruptedException e) {
         warn(LOG, e.getMessage());
@@ -232,11 +223,13 @@ public class Driver
           throw (RuntimeException) e.getCause();
         }
         throw new RuntimeException(e);
+      } catch (final RuntimeException e) {
+        throw e;
       } catch (final Exception e) {
         throw new RuntimeException(e);
       }
     }
-    return $("data", Connection.class, c);
+    return c;
   }
 
   @Override
@@ -268,7 +261,7 @@ public class Driver
       try {
         return DriverManager.getConnection(url, props);
       } catch (final SQLException e) {
-        warn(LOG, retries, e.getMessage());
+        warn(LOG, "connection error", retries, cs.getUrl(), e.getMessage());
         lastException = e;
         retryRateLimiter.acquire(1);
       }
@@ -278,29 +271,33 @@ public class Driver
 
   private void init(final ConnectionSpec cs) throws SQLException {
     final String url = cs.getUrl();
-    final String config = cs.getConfig();
-    synchronized (connectionSource) {
-      if (connectionSource.get(url) == null) {
-        final Future<Callable<Connection>> f = $(new Cost.AsyncProvider() {
-          @Override
-          public <T> Future<T> submit(final Callable<T> c) {
-            return executorService.submit(c);
-          }
-        }, () -> {
-          try (Connection c = getRealConnection(cs)) {
-            final ScriptManager s = new ScriptManager(config, url, c);
-            s.init();
-          }
-          final Callable<Connection> callable = () -> getRealConnection(cs);
-          return callable;
-        });
-        connectionSource.put(url, f);
+    if (!connectionSource.containsKey(url)) {
+      try (Connection cn = getRealConnection(cs)) {
+        new ScriptManager(cs.getConfig(), cs.getUrl(), cn).init();
       }
+      connectionSource.put(url, () -> getRealConnection(cs));
     }
   }
 
   private boolean isAutoCommit(final AtomicReference<Connection> connection) throws SQLException {
     return connection.get().getAutoCommit() == false;
+  }
+
+  private boolean isPrimativeInt(final Object o) {
+    if (o == null) {
+      return false;
+    }
+    final Class<? extends Object> clz = o.getClass();
+    final Class<?> componentType = clz.getComponentType();
+    final boolean isArray = clz.isArray();
+    return componentType.isPrimitive() && !isArray && componentType.getName().equals("int");
+  }
+
+  private boolean isPrimativeIntArray(final Object o) {
+    final Class<? extends Object> clz = o.getClass();
+    final Class<?> componentType = clz.getComponentType();
+    final boolean isArray = clz.isArray();
+    return componentType.isPrimitive() && isArray && componentType.getName().equals("int");
   }
 
   private boolean isValid(final ConnectionSpec cs, final AtomicReference<Connection> connection) {
@@ -349,10 +346,10 @@ public class Driver
         } else if (methodName.equals("prepareStatement")) {
           if (a.length == 1) {
             return createPreparedStatement(connection, cs, (String) a[0]);
-          } else if (a.length == 2 && a[1] instanceof Integer) {
-            return createPreparedStatement(connection, cs, (String) a[0], (Integer) a[1]);
-          } else if (a.length == 2 && a[1] instanceof Integer[]) {
-            return createPreparedStatement(connection, cs, (String) a[0], (Integer[]) a[1]);
+          } else if (a.length == 2 && isPrimativeInt(a[1])) {
+            return createPreparedStatement(connection, cs, (String) a[0], (int) a[1]);
+          } else if (a.length == 2 && isPrimativeIntArray(a[1])) {
+            return createPreparedStatement(connection, cs, (String) a[0], (int[]) a[1]);
           } else if (a.length == 2 && a[1] instanceof String[]) {
             return createPreparedStatement(connection, cs, (String) a[0], (String[]) a[1]);
           } else if (a.length == 3) {
