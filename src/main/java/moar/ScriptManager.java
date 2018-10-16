@@ -179,7 +179,8 @@ public class ScriptManager {
     try {
       register(register, id, runEvent);
     } catch (final SQLException ex) {
-      warn(LOG, "unable to register script (another instance may be running it)", id);
+      warn(LOG, "unable to register script (another instance may be running it)", id, ex.getErrorCode(),
+          ex.getSQLState(), ex.getMessage());
       return false;
     }
     final StatementReader stream = new StatementReader(getResource(id));
